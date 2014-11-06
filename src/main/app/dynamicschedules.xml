@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core" xmlns:json="http://www.mulesoft.org/schema/mule/json" xmlns:mulexml="http://www.mulesoft.org/schema/mule/xml" xmlns:jms="http://www.mulesoft.org/schema/mule/jms" xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" xmlns:vm="http://www.mulesoft.org/schema/mule/vm" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" version="EE-3.5.2"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+http://www.mulesoft.org/schema/mule/jms http://www.mulesoft.org/schema/mule/jms/current/mule-jms.xsd
+http://www.mulesoft.org/schema/mule/json http://www.mulesoft.org/schema/mule/json/current/mule-json.xsd
+http://www.mulesoft.org/schema/mule/xml http://www.mulesoft.org/schema/mule/xml/current/mule-xml.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+    <db:generic-config name="WipDb2Config" url="jdbc:db2:uk01dv11db:50050/NTP7WIP" driverClassName="com.ibm.db2.jcc.DB2Driver" doc:name="Generic Database Configuration"/>
+    <jms:activemq-connector name="Active_MQ" username="admin" password="admin" brokerURL="tcp://localhost:61616" validateConnections="true" doc:name="Active MQ"/>
+    <db:generic-config name="COREDb2" url="db2:jdbc:/uk01dv11db:50050/NTP7CORE" driverClassName="com.ibm.db2.jcc.DB2Driver" doc:name="Generic Database Configuration"/>
+    <sub-flow name="EnrichService" doc:name="EnrichService" doc:description="Enriches the service for data elements like
+	Codesharae
+	DEI info">
+        <enricher doc:name="ParticipantEnricher" doc:description="Fills out the participant data on the message payload">
+            <ee:cache filterExpression="#[message.payload.hasParticipants()]" doc:name="Cache">
+                <db:select config-ref="COREDb2" doc:name="ParticipantLookup" doc:description="Selects CORE.PARTY_ROLE_NAME recorrds to fill in the participant_xml values">
+                    <db:parameterized-query><![CDATA[select * from core.party_role_name where party_role_name_id = #[payload.getParticipantRoleNameId()]]]></db:parameterized-query>
+                </db:select>
+            </ee:cache>
+        </enricher>
+        <enricher doc:name="OptionalElementEnricher" doc:description="Fills out the optional element data on the message payload">
+            <ee:cache doc:name="Cache"/>
+        </enricher>
+        <enricher doc:name="DuplicateLegEnricher" doc:description="Fills out the duplicate leg data on the message payload">
+            <ee:cache doc:name="Cache"/>
+        </enricher>
+        <enricher doc:name="TrafficRestrictionEnricher" doc:description="Fills out the traffic restriction data on the message payload">
+            <ee:cache doc:name="Cache"/>
+        </enricher>
+        <enricher doc:name="PartnershipEnricher" doc:description="Fills out the partnership data on the message payload">
+            <ee:cache doc:name="Cache"/>
+        </enricher>
+    </sub-flow>
+    <flow name="selectServiceRecords" doc:name="selectServiceRecords" doc:description="Select the records for a specific sched_verison_id and service from RT_SCHED.SCHEDULES_OUTPUT
+Aggregate the records into a POJO representing the service
+Transform in our formats and send to the relevant topic">
+        <vm:inbound-endpoint exchange-pattern="one-way"  doc:name="VM" path="services"/>
+        <db:select config-ref="WipDb2Config" doc:name="Database">
+            <db:parameterized-query><![CDATA[select * from rt_sched.schedules_ouput where sched_version_id = 0 and service_num=0 and COALESCE(customer_id,0)=0]]></db:parameterized-query>
+        </db:select>
+        <custom-aggregator failOnTimeout="true" class="com.oag.dynamic.processing.ServiceRecordAggregator" doc:name="Custom Aggregator" doc:description="Aggregates the records from the database query into a Java object"/>
+        <flow-ref name="EnrichService" doc:name="Flow Reference" doc:description="Call the enrichment sub-flow to fill in details"/>
+        <scatter-gather doc:name="Scatter-Gather">
+            <processor-chain>
+                <custom-transformer class="com.oag.dynamic.transformation.SSMTransformer" doc:name="SSMTransformer" doc:description="Transforms the schedules POJO to SSM format"/>
+                <jms:outbound-endpoint topic="ssmFormat" connector-ref="Active_MQ" doc:name="SSMTopic"/>
+            </processor-chain>
+            <processor-chain>
+                <mulexml:object-to-xml-transformer doc:name="Object to XML"/>
+                <jms:outbound-endpoint topic="xmlTopic" connector-ref="Active_MQ" doc:name="xmlTopic"/>
+            </processor-chain>
+            <processor-chain>
+                <json:object-to-json-transformer doc:name="Object to JSON"/>
+                <jms:outbound-endpoint topic="jsonTopic" connector-ref="Active_MQ" doc:name="jsonTopic"/>
+            </processor-chain>
+        </scatter-gather>
+    </flow>
+    <flow name="selectSchedulesServices" doc:name="selectSchedulesServices" doc:description="Select the services within a UOW identified from selectControlRecordsFlow">
+        <vm:inbound-endpoint exchange-pattern="one-way" path="schedVersion" doc:name="VM"/>
+        <db:select config-ref="WipDb2Config" doc:name="Database">
+            <db:parameterized-query><![CDATA[select distinct sched_version_id, service_num from rt_sched.schedules_output where sched_Version_id = #[payload.schedVersionId] and COALESCE(customer_id,0)=0
+and last_update_timestamp between #[payload.from_ts] and #[payload.to_ts]]]></db:parameterized-query>
+        </db:select>
+        <foreach doc:name="ForEachService" doc:description="For each service pass a pojo to the VM of the select service records flow">
+            <vm:outbound-endpoint exchange-pattern="one-way" path="services" doc:name="VM"/>
+        </foreach>
+    </flow>
+    <flow name="selectControlRecordsFlow" doc:name="selectControlRecordsFlow" doc:description="Selects unprocessed records from RT_SCHED.WIP_CHANGE_CNTRL">
+        <poll doc:name="Poll">
+            <fixed-frequency-scheduler frequency="10" timeUnit="SECONDS"/>
+            <watermark variable="lastControlId" default-expression="0" selector="MAX" selector-expression="payload.control_id"/>
+            <db:select config-ref="WipDb2Config" doc:name="SelectUnProcessedCntlRecs">
+                <db:parameterized-query><![CDATA[select * from rt_sched.wip_change_cntrl where processed_ind = 0 and control_id > #[flowVars['lastControlId']] order by control_id asc]]></db:parameterized-query>
+            </db:select>
+        </poll>
+        <foreach doc:name="ForEachCntlRec">
+            <vm:outbound-endpoint exchange-pattern="one-way" path="schedVersion" doc:name="VM"/>
+        </foreach>
+    </flow>
+</mule>
